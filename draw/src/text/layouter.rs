@@ -909,10 +909,31 @@ fn is_no_break_before_char(c: char) -> bool {
         | '\u{2026}' // …
         | '%'
         | '\u{00B0}' // °
+        // CJK full-width punctuation (kinsoku: never at the start of a line)
+        | '\u{3001}' // 、
+        | '\u{3002}' // 。
+        | '\u{FF0C}' // ，
+        | '\u{FF0E}' // ．
+        | '\u{FF1A}' // ：
+        | '\u{FF1B}' // ；
+        | '\u{FF01}' // ！
+        | '\u{FF1F}' // ？
+        | '\u{FF09}' // ）
+        | '\u{FF3D}' // ］
+        | '\u{FF5D}' // ｝
+        | '\u{FF05}' // ％
+        | '\u{300D}' // 」
+        | '\u{300F}' // 』
+        | '\u{3011}' // 】
+        | '\u{300B}' // 》
+        | '\u{3009}' // 〉
+        | '\u{3015}' // 〕
+        | '\u{3017}' // 〗
+        | '\u{FF5E}' // ～
     )
 }
 
-/// Characters after which a line break should not occur (UAX#14 class OP).
+/// Characters after which a line break should not occur (UAX#14 classes OP and PR).
 fn is_no_break_after_char(c: char) -> bool {
     matches!(
         c,
@@ -922,6 +943,23 @@ fn is_no_break_after_char(c: char) -> bool {
         | '\u{201C}' // \u{201c}
         | '\u{2039}' // ‹
         | '\u{00AB}' // «
+        // CJK full-width opening brackets (kinsoku: never at the end of a line)
+        | '\u{FF08}' // （
+        | '\u{FF3B}' // ［
+        | '\u{FF5B}' // ｛
+        | '\u{300C}' // 「
+        | '\u{300E}' // 『
+        | '\u{3010}' // 【
+        | '\u{300A}' // 《
+        | '\u{3008}' // 〈
+        | '\u{3014}' // 〔
+        | '\u{3016}' // 〖
+        // PR: currency prefixes stay with the amount that follows ("¥6", "$5")
+        | '$'
+        | '\u{00A5}' // ¥
+        | '\u{FFE5}' // ￥
+        | '\u{00A3}' // £
+        | '\u{20AC}' // €
     )
 }
 
@@ -1570,6 +1608,24 @@ mod tests {
             merged_segments("(News Hello): world"),
             vec!["(News", " ", "Hello):", " ", "world"]
         );
+    }
+
+    #[test]
+    fn cjk_punctuation_sticks_to_neighbours() {
+        let segs = merged_segments("还没拆，2 天后「退回」。");
+        assert!(
+            segs.iter().all(|s| !s.starts_with('，') && !s.starts_with('」') && !s.starts_with('。')),
+            "{segs:?}"
+        );
+        assert!(segs.iter().all(|s| !s.ends_with('「')), "{segs:?}");
+        assert!(segs.iter().any(|s| s.ends_with("拆，")), "{segs:?}");
+    }
+
+    #[test]
+    fn currency_prefix_sticks_to_amount() {
+        let segs = merged_segments("手续费 ¥6，5%");
+        assert!(segs.iter().all(|s| !s.ends_with('¥')), "{segs:?}");
+        assert!(segs.iter().any(|s| s.starts_with("¥6")), "{segs:?}");
     }
 
     #[test]
