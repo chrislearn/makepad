@@ -1848,7 +1848,10 @@ impl WidgetTree {
             Self::invalidate_path_cache_from_child_change(inner, uid);
         }
 
-        if mark_structure_dirty {
+        // A lookup refresh must retire detached graph nodes too. Otherwise the
+        // old child list is forgotten here, so a later dense rebuild can never
+        // discover the detached subtree to release its weak refs/path caches.
+        {
             for removed_uid in old_children {
                 let still_child = inner.graph.get(&uid).map_or(false, |node| {
                     node.children.iter().any(|child| *child == removed_uid)
@@ -1862,7 +1865,7 @@ impl WidgetTree {
                     .get(&removed_uid)
                     .map_or(false, |node| node.parent == Some(uid));
                 if should_remove {
-                    Self::remove_subtree(inner, removed_uid);
+                    Self::remove_subtree_with_mode(inner, removed_uid, mark_structure_dirty);
                 }
             }
         }
@@ -1871,13 +1874,21 @@ impl WidgetTree {
     }
 
     fn remove_subtree(inner: &mut WidgetTreeInner, uid: WidgetUid) {
+        Self::remove_subtree_with_mode(inner, uid, true);
+    }
+
+    fn remove_subtree_with_mode(inner: &mut WidgetTreeInner, uid: WidgetUid, rebuild: bool) {
         let Some(node) = inner.graph.remove(&uid) else {
             return;
         };
 
         inner.dirty.remove(&uid);
         inner.path_cache.remove(&uid);
-        inner.structure_dirty = true;
+        if rebuild {
+            inner.structure_dirty = true;
+        } else {
+            inner.dense_stale = true;
+        }
 
         for child_uid in node.children {
             let has_same_parent = inner
@@ -1885,7 +1896,7 @@ impl WidgetTree {
                 .get(&child_uid)
                 .map_or(false, |child| child.parent == Some(uid));
             if has_same_parent {
-                Self::remove_subtree(inner, child_uid);
+                Self::remove_subtree_with_mode(inner, child_uid, rebuild);
             }
         }
     }
@@ -2157,6 +2168,16 @@ impl WidgetTree {
     /// every node under the entrypoint.
     pub fn stats(&self) -> WidgetTreeStats {
         self.inner.borrow().stats
+    }
+
+    /// Retained graph/cache entries, including dead weak references. Unlike a
+    /// visual snapshot this also exposes detached-node leaks to native soaks.
+    pub fn retained_entry_counts(&self) -> (usize, usize) {
+        let inner = self.inner.borrow();
+        (
+            inner.graph.len(),
+            inner.path_cache.values().flat_map(|cache| cache.values()).map(Vec::len).sum(),
+        )
     }
 
     /// Look up a widget by its UID.
@@ -3381,6 +3402,29 @@ mod tests {
             children,
             skip_search: true,
         }))
+    }
+
+    #[test]
+    fn lookup_refresh_reclaims_replaced_rows_and_their_path_caches() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let children = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let root = make_dynamic_widget(root_uid, children.clone());
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        for _ in 0..2000 {
+            let leaf = make_widget(WidgetUid::new(), vec![]);
+            let row = make_widget(WidgetUid::new(), vec![(name("leaf"),leaf.clone())]);
+            let row_uid = row.widget_uid();
+            *children.borrow_mut() = vec![(name("row"),row.clone())];
+            // This is the lookup-only refresh used while PortalList's owner is
+            // borrowed; it must release old rows without forcing dense work.
+            tree.refresh_from_borrowed(root_uid, |visit| visit(name("row"),row.clone()));
+            assert_eq!(tree.find_within(root_uid,&[name("row"),name("leaf")]).widget_uid(),leaf.widget_uid());
+            assert_eq!(tree.find_within(row_uid,&[name("leaf")]).widget_uid(),leaf.widget_uid());
+            let (nodes,paths)=tree.retained_entry_counts();
+            assert!(nodes <= 3,"detached rows retained: {nodes}");
+            assert!(paths <= 3,"detached path maps retained: {paths}");
+        }
     }
 
     fn name(s: &str) -> LiveId {

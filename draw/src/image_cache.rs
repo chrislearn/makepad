@@ -122,7 +122,32 @@ const MAX_IMAGE_DECODED_BYTES: usize = if cfg!(target_arch = "wasm32") {
 };
 const IMAGE_RGBA_BYTES_PER_PIXEL: usize = std::mem::size_of::<u32>();
 /// Hard upper bound on total pixels in a decoded buffer or animation atlas.
-const MAX_IMAGE_PIXELS: usize = MAX_IMAGE_DECODED_BYTES / IMAGE_RGBA_BYTES_PER_PIXEL;
+fn max_image_pixels() -> usize {
+    image_decode_limit() / IMAGE_RGBA_BYTES_PER_PIXEL
+}
+
+thread_local! {
+    static IMAGE_DECODE_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_IMAGE_DECODED_BYTES) };
+}
+
+fn image_decode_limit() -> usize {
+    IMAGE_DECODE_LIMIT.with(std::cell::Cell::get)
+}
+
+/// Restricts this request's decoder allocations, including an async worker.
+/// Nested scopes can only tighten the policy; unwind restores the previous one.
+pub fn with_image_decode_limit<T>(bytes: usize, decode: impl FnOnce() -> T) -> T {
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            IMAGE_DECODE_LIMIT.with(|limit| limit.set(self.0));
+        }
+    }
+    let previous = image_decode_limit();
+    let _restore = Restore(previous);
+    IMAGE_DECODE_LIMIT.with(|limit| limit.set(previous.min(bytes)));
+    decode()
+}
 /// Hard upper bound on animation frames. Pixel caps alone do not account for
 /// per-frame Vec overhead, which matters for malicious tiny-frame animations.
 const MAX_IMAGE_FRAMES: usize = 4096;
@@ -163,7 +188,7 @@ fn checked_pixel_count_with_limit(
 }
 
 fn checked_pixel_count(width: usize, height: usize) -> Result<usize, ImageError> {
-    checked_pixel_count_with_limit(width, height, MAX_IMAGE_DECODED_BYTES)
+    checked_pixel_count_with_limit(width, height, image_decode_limit())
 }
 
 /// Computes an animation atlas's `(total_width, total_height)` for `frame_count`
@@ -175,7 +200,7 @@ fn animation_atlas_layout(
     width: usize,
     height: usize,
 ) -> Result<(usize, usize), ImageError> {
-    animation_atlas_layout_with_limit(frame_count, width, height, MAX_IMAGE_DECODED_BYTES)
+    animation_atlas_layout_with_limit(frame_count, width, height, image_decode_limit())
 }
 
 fn animation_atlas_layout_with_limit(
@@ -408,7 +433,7 @@ impl ImageBuffer {
         let frame_pixels = checked_pixel_count(width, height)?;
         let output_len = frame_pixels
             .checked_mul(num_components)
-            .filter(|&len| len <= MAX_IMAGE_DECODED_BYTES)
+            .filter(|&len| len <= image_decode_limit())
             .ok_or(ImageError::DimensionsTooLarge { width, height })?;
         let mut output = vec![0; output_len];
         // The atlas is sized from the declared `num_frames`; the decode loop below
@@ -497,13 +522,13 @@ impl ImageBuffer {
         let cursor = std::io::Cursor::new(data);
         let mut decoder =
             WebPDecoder::new(std::io::BufReader::new(cursor)).map_err(ImageError::WebpDecode)?;
-        decoder.set_memory_limit(MAX_IMAGE_PIXELS * 4);
+        decoder.set_memory_limit(max_image_pixels() * 4);
         let (width, height) = decoder.dimensions();
         let (width, height) = (width as usize, height as usize);
         let frame_pixels = checked_pixel_count(width, height)?;
         let buf_size = decoder
             .output_buffer_size()
-            .filter(|&len| len <= MAX_IMAGE_DECODED_BYTES)
+            .filter(|&len| len <= image_decode_limit())
             .ok_or(ImageError::WebpDecode(WebpDecodeErrors::ImageTooLarge))?;
 
         if !decoder.is_animated() {
@@ -518,7 +543,7 @@ impl ImageBuffer {
         // so we just collect each composited frame (as RGBA) and its delay, then
         // pack them into an animation atlas like GIF/APNG.
         let has_alpha = decoder.has_alpha();
-        let max_frames = (MAX_IMAGE_PIXELS / frame_pixels).max(1).min(MAX_IMAGE_FRAMES);
+        let max_frames = (max_image_pixels() / frame_pixels).max(1).min(MAX_IMAGE_FRAMES);
         let num_frames = decoder.num_frames() as usize;
         if num_frames > max_frames {
             return Err(ImageError::DimensionsTooLarge { width, height });
@@ -560,7 +585,7 @@ impl ImageBuffer {
         let width = decoder.width() as usize;
         let height = decoder.height() as usize;
         let frame_pixels = checked_pixel_count(width, height)?;
-        let max_frames = (MAX_IMAGE_PIXELS / frame_pixels).max(1).min(MAX_IMAGE_FRAMES);
+        let max_frames = (max_image_pixels() / frame_pixels).max(1).min(MAX_IMAGE_FRAMES);
         let mut frames = Vec::new();
         let mut frame_delays = Vec::new();
         let mut canvas = vec![0u8; frame_pixels * IMAGE_RGBA_BYTES_PER_PIXEL];
@@ -1775,6 +1800,20 @@ mod tests {
     }
 
     #[test]
+    fn test_request_decode_limit_is_restored_and_checks_actual_pixels() {
+        let png = static_png_2x2([10, 20, 30, 255]);
+        let previous = image_decode_limit();
+        assert!(with_image_decode_limit(12, || decode_image_from_data(&png)).is_err());
+        assert_eq!(image_decode_limit(), previous);
+        assert!(with_image_decode_limit(16, || decode_image_from_data(&png)).is_ok());
+        with_image_decode_limit(12, || {
+            with_image_decode_limit(1024, || assert_eq!(image_decode_limit(), 12));
+        });
+        let _ = std::panic::catch_unwind(|| with_image_decode_limit(4, || panic!("decode failed")));
+        assert_eq!(image_decode_limit(), previous);
+    }
+
+    #[test]
     fn test_decode_image_from_data_auto_detects_without_path() {
         for data in [
             bmp_2x2_24bit(10, 20, 30),
@@ -1798,6 +1837,7 @@ where
     ensure_image_cache_inner(cx);
     let image_size_bytes = (*data).as_ref().len();
     let task_key = image_path.clone();
+    let decode_limit = image_decode_limit();
     let job = move || {
             let start = decode_timing_start();
             if image_decode_debug_enabled() {
@@ -1807,7 +1847,9 @@ where
                     image_size_bytes
                 );
             }
-            let result = decode_image_buffer(&image_path, (*data).as_ref()).map(|mut buffer| {
+            let result = with_image_decode_limit(decode_limit, || {
+                decode_image_buffer(&image_path, (*data).as_ref())
+            }).map(|mut buffer| {
                 // Mip-chain generation belongs with the decode: doing it here keeps the
                 // box-filter cost off the UI thread when the texture is committed.
                 buffer.build_cpu_mip_chain_if_uploaded();
