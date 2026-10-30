@@ -42,6 +42,36 @@ const SMOOTH_SCROLL_MAXIMUM_WINDOW: usize = 20;
 /// distance, so a long list doesn't crawl at a fixed pixels-per-frame rate.
 const SMOOTH_SCROLL_TO_END_FRAMES: f64 = 24.0;
 
+// An unbounded window must never evaluate an unused reanchor offset: adding
+// usize::MAX to a nonzero target would overflow even when no reanchor is needed.
+fn smooth_scroll_starting_id(first: usize, target: usize, window: usize) -> Option<usize> {
+    if target > first {
+        (target - first > window).then(|| target - window)
+    } else {
+        (first - target > window).then(|| target + window)
+    }
+}
+
+#[cfg(test)]
+mod scroll_window_tests {
+    use super::smooth_scroll_starting_id;
+
+    #[test]
+    fn unbounded_scroll_keeps_the_anchor_without_overflow() {
+        for (first, target) in [(12, 11), (11, 11), (11, 12), (usize::MAX, usize::MAX - 1)] {
+            assert_eq!(smooth_scroll_starting_id(first, target, usize::MAX), None);
+        }
+    }
+
+    #[test]
+    fn finite_scroll_windows_only_reanchor_distant_targets() {
+        assert_eq!(smooth_scroll_starting_id(100, 10, 20), Some(30));
+        assert_eq!(smooth_scroll_starting_id(10, 100, 20), Some(80));
+        assert_eq!(smooth_scroll_starting_id(30, 10, 20), None);
+        assert_eq!(smooth_scroll_starting_id(usize::MAX, usize::MAX - 10, 3), Some(usize::MAX - 7));
+    }
+}
+
 enum ScrollState {
     Stopped,
     Drag {
@@ -1882,14 +1912,7 @@ impl PortalList {
             }
         };
 
-        let starting_id: Option<usize>;
-        if target_id > self.first_id {
-            starting_id = ((target_id.saturating_sub(self.first_id)) > max_items_to_show)
-                .then_some(target_id.saturating_sub(max_items_to_show));
-        } else {
-            starting_id = ((self.first_id.saturating_sub(target_id)) > max_items_to_show)
-                .then_some(target_id + max_items_to_show);
-        }
+        let starting_id = smooth_scroll_starting_id(self.first_id, target_id, max_items_to_show);
 
         if let Some(start) = starting_id {
             self.first_id = start;
