@@ -1157,21 +1157,37 @@ pub struct LaidoutText {
 }
 
 impl LaidoutText {
-    /// How far down the text has to move for its *ink* to sit in the middle of
-    /// the box `size_in_lpxs` describes, instead of its line box.
+    /// Shift shaped outline ink to the center of the allocated line box.
     ///
-    /// The box this text occupies runs from the first row's ascender down to
-    /// the last row's descender. The ink runs from the first row's cap line
-    /// down to the last row's baseline. A text face's ascender reaches further
-    /// above the cap line than its descender reaches below the baseline, so
-    /// the two centers do not coincide and the ink reads as sitting high. The
-    /// difference works out to `(descender + cap_height - ascender) / 2`
-    /// whatever the row count, because both boxes share everything in between.
-    ///
-    /// Returns `0.0` when the metrics are not trustworthy enough to move
-    /// anything: a face with no capital (icon and symbol fonts), or one whose
-    /// cap height claims to reach past its own ascender.
+    /// Glyph origins include fallback faces and shaping offsets. Bitmap runs
+    /// retain the cap-height approximation, since outline bounds cannot describe
+    /// their pixels. Layout dimensions and hit testing are never changed.
     pub fn ink_center_offset_in_lpxs(&self) -> f32 {
+        // A cap-height band is only an approximation for a particular font.
+        // CJK fallback glyphs, lowercase labels and combining marks can extend
+        // beyond it. Use the actual shaped outlines, in the same y-down row
+        // coordinates as DrawText, without changing the layout/hit-test boxes.
+        let mut has_bitmap = false;
+        let mut top = f32::INFINITY;
+        let mut bottom = f32::NEG_INFINITY;
+        for row in &self.rows {
+            for glyph in &row.glyphs {
+                let mut outline = None;
+                if let Some(bounds) = glyph.font.glyph_outline_bounds_in_ems(glyph.id, &mut outline) {
+                    if bounds.size.width > 0.0 && bounds.size.height > 0.0 {
+                        let baseline = row.origin_in_lpxs.y + glyph.origin_in_lpxs.y;
+                        top = top.min(baseline - (bounds.origin.y + bounds.size.height) * glyph.font_size_in_lpxs);
+                        bottom = bottom.max(baseline - bounds.origin.y * glyph.font_size_in_lpxs);
+                    }
+                } else if glyph.font.has_glyph_raster_image(glyph.id, glyph.font_size_in_lpxs) {
+                    has_bitmap = true;
+                }
+            }
+        }
+        if !has_bitmap && top.is_finite() && bottom.is_finite() && bottom > top {
+            return (self.size_in_lpxs.height - top - bottom) * 0.5;
+        }
+        // Bitmap-only and empty runs retain the conservative metrics fallback.
         let (Some(first), Some(last)) = (self.rows.first(), self.rows.last()) else {
             return 0.0;
         };
